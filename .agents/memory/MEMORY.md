@@ -1,1 +1,2 @@
 - [Telegram emoji scoping](telegram-emoji-scoping.md) — choose custom emoji per message family so referral UI does not inherit game-pack animation.
+- [Python Telegram package collision](python-telegram-package-collision.md) — never install the unrelated `telegram` distribution beside `python-telegram-bot`.
