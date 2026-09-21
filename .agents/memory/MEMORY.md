@@ -1,0 +1,1 @@
+- [Telegram emoji scoping](telegram-emoji-scoping.md) — choose custom emoji per message family so referral UI does not inherit game-pack animation.

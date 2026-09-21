@@ -206,6 +206,11 @@ _GAME_MSG_OWNER_LIMIT = 800
 # ContextVar — set to the triggering user's ID at the entry of every handler
 # so the ownership tracker interceptor can auto-register any bot reply.
 _handler_user_cv: contextvars.ContextVar[str] = contextvars.ContextVar('handler_user', default='')
+# Referral screens use only the flat/simple icons from the public pack.
+# Keep the full premium/custom-emoji interceptor available everywhere else.
+_plain_emoji_context_cv: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "plain_emoji_context", default="default"
+)
 
 # ─── Non-withdrawable casino coins ───────────────────────────────────────────
 # Coins are a separate play-only wallet.  They never enter the real-money
@@ -252,6 +257,24 @@ _TG_EMOJI_BLOCK_RE = re.compile(
 def _strip_custom_emoji_markup(text: str) -> str:
     """Keep a custom emoji tag's literal fallback and discard its premium ID."""
     return _TG_EMOJI_BLOCK_RE.sub(r"\1", str(text))
+
+
+_REFERRAL_SIMPLE_EMOJI_SYMBOLS = frozenset({
+    "ℹ️", "🔗", "🔥", "📈", "💰", "💵", "💬", "⭐", "💎",
+    "⚡", "👑", "🔒", "📥", "📤", "⚙️", "📉", "💸",
+})
+
+
+def _emoji_map_for_context() -> dict:
+    """Restrict referral screens to the pack's simple, flat emoji symbols."""
+    if _plain_emoji_context_cv.get() == "simple":
+        return {
+            symbol: emoji_id
+            for symbol, emoji_id in CUSTOM_EMOJI_MAP.items()
+            if symbol in _REFERRAL_SIMPLE_EMOJI_SYMBOLS
+        }
+    return CUSTOM_EMOJI_MAP
+
 
 def _button_label(text: str) -> str:
     """Return button-safe text while keeping the custom emoji fallback."""
@@ -9696,7 +9719,7 @@ _TG_HTML_TYPE_MAP = {
 }
 
 
-def _render_html_premium(html: str):
+def _render_html_premium(html: str, emoji_map: dict | None = None):
     """
     Parse a Telegram-style HTML message into (text, entities) and add an
     animated custom-emoji entity for every character that exists in
@@ -9709,6 +9732,7 @@ def _render_html_premium(html: str):
     <tg-emoji> tags are honoured: their emoji-id is used directly and the
     fallback text inside is NOT re-mapped through CUSTOM_EMOJI_MAP.
     """
+    active_map = CUSTOM_EMOJI_MAP if emoji_map is None else emoji_map
     if html is None:
         return None, []
     out_chars: list[str] = []
@@ -9797,7 +9821,7 @@ def _render_html_premium(html: str):
                 d = _TG_HTML_ENTITY_MAP[em.group(1)]
                 d_utf16 = len(d.encode("utf-16-le")) // 2
                 # Don't re-map inside a <tg-emoji> tag
-                ce_id = (CUSTOM_EMOJI_MAP.get(d) if CUSTOM_EMOJI_MAP else None) if not tg_emoji_stack else None
+                ce_id = (active_map.get(d) if active_map else None) if not tg_emoji_stack else None
                 if ce_id:
                     entities.append(MessageEntity(
                         type=MessageEntity.CUSTOM_EMOJI,
@@ -9812,7 +9836,7 @@ def _render_html_premium(html: str):
 
         ch_utf16 = len(ch.encode("utf-16-le")) // 2
         # Don't re-map fallback chars that are inside a <tg-emoji> tag
-        ce_id = (CUSTOM_EMOJI_MAP.get(ch) if CUSTOM_EMOJI_MAP else None) if not tg_emoji_stack else None
+        ce_id = (active_map.get(ch) if active_map else None) if not tg_emoji_stack else None
         if ce_id:
             entities.append(MessageEntity(
                 type=MessageEntity.CUSTOM_EMOJI,
@@ -9827,22 +9851,24 @@ def _render_html_premium(html: str):
     return "".join(out_chars), entities
 
 
-def _has_premium_emoji(text: str) -> bool:
+def _has_premium_emoji(text: str, emoji_map: dict | None = None) -> bool:
     """Cheap pre-check for Unicode characters covered by the active pack."""
-    if not text or not CUSTOM_EMOJI_MAP:
+    active_map = CUSTOM_EMOJI_MAP if emoji_map is None else emoji_map
+    if not text or not active_map:
         return False
-    return any(ch in CUSTOM_EMOJI_MAP for ch in text)
+    return any(ch in active_map for ch in text)
 
 
-def _render_plain_premium(text: str):
+def _render_plain_premium(text: str, emoji_map: dict | None = None):
     """Convert active-pack Unicode emoji into Telegram custom emoji entities."""
-    if not text or not CUSTOM_EMOJI_MAP:
+    active_map = CUSTOM_EMOJI_MAP if emoji_map is None else emoji_map
+    if not text or not active_map:
         return text, []
     entities = []
     utf16_off = 0
     for ch in text:
         ch_utf16 = len(ch.encode("utf-16-le")) // 2
-        ce_id = CUSTOM_EMOJI_MAP.get(ch)
+        ce_id = active_map.get(ch)
         if ce_id:
             entities.append(MessageEntity(
                 type=MessageEntity.CUSTOM_EMOJI,
@@ -9918,13 +9944,16 @@ def _install_premium_emoji_interceptor(bot) -> None:
                         else:
                             kwargs[text_kwarg] = clean_txt
                         txt = clean_txt
+                emoji_map = _emoji_map_for_context()
+                if _plain_emoji_context_cv.get() == "plain":
+                    return await original(self, *args, **kwargs)
                 pm = kwargs.get("parse_mode")
                 # Unwrap PTB DefaultValue sentinel if needed
                 if hasattr(pm, 'value'):
                     pm = pm.value
                 already_ents = kwargs.get(entities_kwarg)
                 if isinstance(already_ents, (list, tuple)):
-                    allowed_custom_ids = set(CUSTOM_EMOJI_MAP.values())
+                    allowed_custom_ids = set(emoji_map.values())
                     static_ents = [
                         entity
                         for entity in already_ents
@@ -9940,14 +9969,14 @@ def _install_premium_emoji_interceptor(bot) -> None:
                 if (
                     not has_ents
                     and isinstance(txt, str)
-                    and _has_premium_emoji(txt)
+                    and _has_premium_emoji(txt, emoji_map)
                 ):
                     if pm in HTML_VALUES:
-                        new_text, ents = _render_html_premium(txt)
+                        new_text, ents = _render_html_premium(txt, emoji_map)
                     elif pm in MARKDOWN_VALUES:
                         new_text, ents = txt, []  # don't touch markdown
                     else:
-                        new_text, ents = _render_plain_premium(txt)
+                        new_text, ents = _render_plain_premium(txt, emoji_map)
                     if ents:
                         # ── Save originals before mutating kwargs ──
                         _orig_text  = kwargs.get(text_kwarg)
@@ -10804,7 +10833,13 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         [InlineKeyboardButton("💬 For chat owners", callback_data="ref_chat_owners")],
         [InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")],
     ])
-    await update.message.reply_text(ref_text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    plain_emoji_token = _plain_emoji_context_cv.set("simple")
+    try:
+        await update.message.reply_text(
+            ref_text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    finally:
+        _plain_emoji_context_cv.reset(plain_emoji_token)
     return
 
     # Legacy image-based referral screen retained below for migration safety.
@@ -10915,9 +10950,13 @@ async def _show_referral_screen(query, context) -> None:
         [InlineKeyboardButton("💬 For chat owners", callback_data="ref_chat_owners")],
         [InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")],
     ])
-    await _edit_callback_text_or_send(
-        query, context, ref_text, reply_markup=markup, parse_mode=ParseMode.HTML
-    )
+    plain_emoji_token = _plain_emoji_context_cv.set("simple")
+    try:
+        await _edit_callback_text_or_send(
+            query, context, ref_text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    finally:
+        _plain_emoji_context_cv.reset(plain_emoji_token)
 
 
 async def _show_chat_owner_referral_screen(query, context) -> None:
@@ -10948,9 +10987,13 @@ async def _show_chat_owner_referral_screen(query, context) -> None:
         [InlineKeyboardButton("🌐 Language: English", callback_data="ref_language")],
         [InlineKeyboardButton("◀️ Back", callback_data="ref_command")],
     ])
-    await _edit_callback_text_or_send(
-        query, context, owner_text, reply_markup=markup, parse_mode=ParseMode.HTML
-    )
+    plain_emoji_token = _plain_emoji_context_cv.set("simple")
+    try:
+        await _edit_callback_text_or_send(
+            query, context, owner_text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    finally:
+        _plain_emoji_context_cv.reset(plain_emoji_token)
 
 
 async def streak_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
