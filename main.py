@@ -3412,6 +3412,12 @@ referral_daily_earnings = {}   # {referrer_id: {date_str: float}} — per-day ch
 referral_top_referred = {}     # {referrer_id: {referred_id: float}} — per-referred earnings
 referral_codes = {}            # {user_id: code_str}  — friendly referral codes
 referral_codes_reverse = {}    # {code_str: user_id}  — reverse lookup
+# Persistent activity counters for the referral statistics screen.  The
+# source-of-truth relationship is still referral_data; this ledger records
+# referred-user deposits, completed games, and commission events without
+# relying on a UI refresh or an in-memory-only counter.
+referral_activity_stats = {}
+_referral_stats_lock = threading.RLock()
 # {chat_id: {owner_id, title, username, registered_at}}
 chat_owner_groups = {}
 REFERRAL_REVENUE_SHARE = 0.30
@@ -3433,6 +3439,113 @@ def _sync_referral_profile_count(referrer_id: str) -> int:
     return count
 
 
+def _referral_stats_entry(referrer_id: str) -> dict:
+    """Return a normalized persistent stats entry for one referrer."""
+    rid = str(referrer_id)
+    with _referral_stats_lock:
+        entry = referral_activity_stats.setdefault(rid, {})
+        entry.setdefault("referrals_count", 0)
+        entry.setdefault("games_played", 0)
+        entry.setdefault("wagered_total", 0.0)
+        entry.setdefault("deposits_count", 0)
+        entry.setdefault("deposits_total", 0.0)
+        entry.setdefault("earnings_events", 0)
+        entry.setdefault("earned_total", 0.0)
+        entry.setdefault("daily", {})
+        return entry
+
+
+def _referral_daily_stats(entry: dict, day: str) -> dict:
+    daily = entry.setdefault("daily", {})
+    row = daily.setdefault(day, {})
+    for key in ("new_users", "games_played", "deposits_count", "earnings_events"):
+        row.setdefault(key, 0)
+    for key in ("wagered_total", "deposits_total", "earned_total"):
+        row.setdefault(key, 0.0)
+    return row
+
+
+def _referral_day() -> str:
+    import datetime as _referral_dt
+    return _referral_dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def _record_referral_activity(
+    referred_user_id: str,
+    activity: str,
+    amount: float = 0.0,
+    *,
+    event_count: int = 1,
+) -> None:
+    """Record one referred-user activity in the durable referral ledger.
+
+    Callers invoke this only after their own idempotency boundary has accepted
+    the event (for example, after a deposit payment ID is accepted).  The
+    helper updates both all-time and daily counters in one critical section.
+    """
+    referred_id = str(referred_user_id)
+    referrer_id = str(referral_data.get(referred_id, "") or "")
+    if not referrer_id:
+        return
+    try:
+        numeric_amount = float(amount or 0.0)
+    except (TypeError, ValueError):
+        numeric_amount = 0.0
+    count = max(0, int(event_count or 0))
+    if count == 0:
+        return
+
+    with _referral_stats_lock:
+        entry = _referral_stats_entry(referrer_id)
+        day = _referral_daily_stats(entry, _referral_day())
+        if activity == "referral":
+            entry["referrals_count"] = int(entry.get("referrals_count", 0) or 0) + count
+            day["new_users"] = int(day.get("new_users", 0) or 0) + count
+        elif activity == "game":
+            entry["games_played"] = int(entry.get("games_played", 0) or 0) + count
+            entry["wagered_total"] = float(entry.get("wagered_total", 0.0) or 0.0) + numeric_amount
+            day["games_played"] = int(day.get("games_played", 0) or 0) + count
+            day["wagered_total"] = float(day.get("wagered_total", 0.0) or 0.0) + numeric_amount
+        elif activity == "deposit":
+            entry["deposits_count"] = int(entry.get("deposits_count", 0) or 0) + count
+            entry["deposits_total"] = float(entry.get("deposits_total", 0.0) or 0.0) + numeric_amount
+            day["deposits_count"] = int(day.get("deposits_count", 0) or 0) + count
+            day["deposits_total"] = float(day.get("deposits_total", 0.0) or 0.0) + numeric_amount
+        elif activity == "earning":
+            entry["earnings_events"] = int(entry.get("earnings_events", 0) or 0) + count
+            entry["earned_total"] = float(entry.get("earned_total", 0.0) or 0.0) + numeric_amount
+            day["earnings_events"] = int(day.get("earnings_events", 0) or 0) + count
+            day["earned_total"] = float(day.get("earned_total", 0.0) or 0.0) + numeric_amount
+
+
+def _rebuild_referral_activity_stats_from_legacy() -> None:
+    """Backfill all-time referral activity once for older save files."""
+    with _referral_stats_lock:
+        referral_activity_stats.clear()
+        for referred_id, referrer_id_raw in referral_data.items():
+            referrer_id = str(referrer_id_raw)
+            entry = _referral_stats_entry(referrer_id)
+            entry["referrals_count"] = int(entry.get("referrals_count", 0) or 0) + 1
+
+            profile = user_profiles.get(str(referred_id), {})
+            if isinstance(profile, dict):
+                entry["games_played"] += int(profile.get("lt_games", 0) or 0)
+                entry["wagered_total"] += float(profile.get("lt_wagered", 0.0) or 0.0)
+
+            for deposit in user_deposit_history.get(str(referred_id), []) or []:
+                if not isinstance(deposit, dict):
+                    continue
+                entry["deposits_count"] += 1
+                entry["deposits_total"] += float(deposit.get("amount", 0.0) or 0.0)
+
+            # Existing commission totals are authoritative for historical
+            # earnings; event counts begin at zero and are exact going forward.
+            entry["earned_total"] = (
+                float(referral_wager_earnings.get(referrer_id, 0.0) or 0.0)
+                + float(referral_deposit_earnings.get(referrer_id, 0.0) or 0.0)
+            )
+
+
 def _register_direct_referral(referred_id: str, referrer_id: str) -> bool:
     """Register one first-touch referral and update its persistent counters."""
     referred_id = str(referred_id)
@@ -3450,6 +3563,7 @@ def _register_direct_referral(referred_id: str, referrer_id: str) -> bool:
 
     referral_data[referred_id] = referrer_id
     _sync_referral_profile_count(referrer_id)
+    _record_referral_activity(referred_id, "referral")
     try:
         import datetime as _ref_dt
         today = _ref_dt.datetime.now().strftime("%Y-%m-%d")
@@ -3505,6 +3619,15 @@ def _record_group_revenue_delta(delta: float) -> float:
         float(referral_wager_earnings.get(owner_id, 0.0) or 0.0)
         + owner_share
     )
+    # This is an earning event for the referred player's house-result delta.
+    # Keep the amount signed so the ledger agrees with referral_wager_earnings.
+    with _referral_stats_lock:
+        entry = _referral_stats_entry(owner_id)
+        day = _referral_daily_stats(entry, _referral_day())
+        entry["earnings_events"] = int(entry.get("earnings_events", 0) or 0) + 1
+        entry["earned_total"] = float(entry.get("earned_total", 0.0) or 0.0) + owner_share
+        day["earnings_events"] = int(day.get("earnings_events", 0) or 0) + 1
+        day["earned_total"] = float(day.get("earned_total", 0.0) or 0.0) + owner_share
     try:
         import datetime as _rev_dt
         day = _rev_dt.datetime.now().strftime("%Y-%m-%d")
@@ -6273,7 +6396,8 @@ def load_data():
     global user_coins, user_coin_last_roll, user_wallet_mode
     global user_levels, user_boost_status, user_profiles, game_history, referral_data, referral_earnings, pending_referral_commissions
     global user_gift_profiles, processed_telegram_gifts, unattributed_telegram_gifts, gift_tracking_initialized
-    global referral_wager_earnings, referral_deposit_earnings, referral_daily_earnings, referral_top_referred, referral_codes, referral_codes_reverse, chat_owner_groups
+    global referral_wager_earnings, referral_deposit_earnings, referral_daily_earnings, referral_top_referred, referral_codes, referral_codes_reverse, chat_owner_groups, referral_activity_stats
+    global daily_referral_counts
     global pending_challenges, active_pvp_games, user_wagering_totals, user_losses_rakeback, user_streak_data
     global user_level_bonus_claimed
     global user_last_rakeback_claim, user_raffle_tickets, user_match_history, user_wagering_requirements, user_deposit_totals, user_deposit_history, user_tip_received, user_transfer_codes
@@ -6472,6 +6596,8 @@ def load_data():
         referral_top_referred = data.get('referral_top_referred', {})
         referral_codes = data.get('referral_codes', {})
         referral_codes_reverse = {v: k for k, v in referral_codes.items()}
+        referral_activity_stats = data.get('referral_activity_stats', {})
+        daily_referral_counts = data.get('daily_referral_counts', {})
         chat_owner_groups = data.get('chat_owner_groups', {})
         pending_challenges = data.get('pending_challenges', {})
         active_pvp_games = data.get('active_pvp_games', {})
@@ -6515,6 +6641,8 @@ def load_data():
         user_crypto_bonus_claims = data.get('user_crypto_bonus_claims', {})
         user_deposit_totals = data.get('user_deposit_totals', {})
         user_deposit_history = data.get('user_deposit_history', {})
+        if 'referral_activity_stats' not in data:
+            _rebuild_referral_activity_stats_from_legacy()
         user_last_deposit_ts.update(data.get('user_last_deposit_ts', {}))
         user_tip_received = data.get('user_tip_received', {})
         user_client_seeds = data.get('user_client_seeds', {})
@@ -6882,6 +7010,8 @@ def _save_data_impl():
         'referral_daily_earnings': referral_daily_earnings,
         'referral_top_referred': referral_top_referred,
         'referral_codes': referral_codes,
+        'referral_activity_stats': referral_activity_stats,
+        'daily_referral_counts': daily_referral_counts,
         'chat_owner_groups': chat_owner_groups,
         'pending_challenges': pending_challenges,
         'active_pvp_games': active_pvp_games,
@@ -8650,6 +8780,8 @@ def _process_confirmed_deposit(
             'ts': time.time(), 'amount': usd_amount,
             'currency': pay_currency, 'source': source,
         })
+        _record_referral_activity(user_id, "deposit", usd_amount)
+        add_referral_commission(user_id, usd_amount, "deposit")
         if len(user_deposit_history[user_id]) > 200:
             user_deposit_history[user_id] = user_deposit_history[user_id][-200:]
 
@@ -8928,6 +9060,7 @@ def add_match_history(user_id: str, game_type: str, bet_amount: float, result: s
     if 'lt_first_game_ts' not in p or now_ts < p['lt_first_game_ts']:
         p['lt_first_game_ts'] = now_ts
     p['lt_last_game_ts'] = now_ts
+    _record_referral_activity(user_id, "game", float(bet_amount))
 
     try:
         save_data_critical()
@@ -8963,13 +9096,28 @@ def add_referral_commission(user_id: str, amount: float, commission_type: str = 
         # Determine commission rate based on type
         if commission_type == "deposit":
             commission = amount * REFERRAL_DEPOSIT_COMMISSION  # 8% on deposits
+            referral_deposit_earnings[referrer_id] = (
+                float(referral_deposit_earnings.get(referrer_id, 0.0) or 0.0)
+                + commission
+            )
         else:
             commission = amount * REFERRAL_WAGER_COMMISSION  # 2% on wagers
+            referral_wager_earnings[referrer_id] = (
+                float(referral_wager_earnings.get(referrer_id, 0.0) or 0.0)
+                + commission
+            )
 
         # Add to pending commissions instead of instant payout
         if referrer_id not in pending_referral_commissions:
             pending_referral_commissions[referrer_id] = 0.0
         pending_referral_commissions[referrer_id] += commission
+        with _referral_stats_lock:
+            entry = _referral_stats_entry(referrer_id)
+            day = _referral_daily_stats(entry, _referral_day())
+            entry["earnings_events"] = int(entry.get("earnings_events", 0) or 0) + 1
+            entry["earned_total"] = float(entry.get("earned_total", 0.0) or 0.0) + commission
+            day["earnings_events"] = int(day.get("earnings_events", 0) or 0) + 1
+            day["earned_total"] = float(day.get("earned_total", 0.0) or 0.0) + commission
 
         save_data()
 
@@ -10834,17 +10982,19 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     pending = float(pending_referral_commissions.get(user_id, 0.0) or 0.0)
     claimed = float(referral_earnings.get(user_id, 0.0) or 0.0)
     ref_text = (
-        "ℹ️ <b>Earn bonus from invited users' games</b>\n\n"
-        f"🔗 <b>Referral link:</b> <a href=\"{referral_link}\">{referral_link}</a>\n"
-        "🔥 <b>Current system:</b> Revshare - 30%\n"
-        f"📈 <b>Users invited:</b> {_referral_count(user_id)}\n"
-        f"💰 <b>Total earned:</b> {format_balance_in_currency(pending + claimed, user_currency)}\n\n"
-        f"💵 <b>Referral balance:</b> {format_balance_in_currency(pending, user_currency)}"
+        '<tg-emoji emoji-id="6136241486854888906">ℹ️</tg-emoji> '
+        "<b>Earn bonus from invited users' games</b>\n\n"
+        f'🔗 Referral link: <a href="{referral_link}">{referral_link}</a>\n'
+        "🔥 Current system: Revshare - 30%\n"
+        f"📈 Users invited: {_referral_count(user_id)}\n"
+        f"💰 Total earned: {format_balance_in_currency(pending + claimed, user_currency)}\n\n"
+        f"💵 Referral balance: {format_balance_in_currency(pending, user_currency)}"
     )
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💸 Withdraw", callback_data="ref_withdraw")],
-        [InlineKeyboardButton("💬 For chat owners", callback_data="ref_chat_owners")],
-        [InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")],
+        [primary_btn("Withdraw", callback_data="ref_withdraw")],
+        [primary_btn("Stats", callback_data="ref_stats")],
+        [primary_btn("For chat owners", callback_data="ref_chat_owners")],
+        [primary_btn("Back", callback_data="back_to_menu")],
     ])
     plain_emoji_token = _plain_emoji_context_cv.set("simple")
     try:
@@ -10854,92 +11004,6 @@ async def ref_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     finally:
         _plain_emoji_context_cv.reset(plain_emoji_token)
     return
-
-    # Legacy image-based referral screen retained below for migration safety.
-    username = update.message.from_user.username or update.message.from_user.first_name or "Player"
-    user_currency = get_user_currency(user_id)
-    
-    # Get bot info for links
-    bot_info = await context.bot.get_me()
-    bot_username = bot_info.username
-    
-    # Stats
-    referrals_count = sum(1 for uid, rid in referral_data.items() if str(rid) == user_id)
-    available_funds = pending_referral_commissions.get(user_id, 0.0)
-    withdrawn_funds = referral_earnings.get(user_id, 0.0)
-    
-    # Links
-    referral_link = f"https://t.me/{bot_username}?start={user_id}"
-    group_link = "https://t.me/rollerscasino"
-    
-    referral_message = (
-        "<b>Referral Program</b>\n\n"
-        "Invite your friends to join the bot using referral link and earn money!\n\n"
-        "<b>Benefits</b>\n\n"
-        "- 8% of every deposit made by your referrals ($8 per $100 deposited)\n"
-        "- 20% of profit share\n"
-        "- 10% of the PvP commission of your referrals ($0 per $100 wagered)\n\n"
-        "<b>Group owners additional advantages</b>\n\n"
-        "- 40% of the dice PvP commission in your group ($0 per $100 wagered)\n\n"
-        f"Referrals count: <b>{referrals_count}</b>\n\n"
-        f"Available funds: <b>{format_balance_in_currency(available_funds, user_currency)}</b>\n"
-        f"Withdrawn funds: <b>{format_balance_in_currency(withdrawn_funds, user_currency)}</b>\n\n"
-        f"Your bot referral link: {referral_link}\n"
-        f"Your group referral link: {group_link}\n\n"
-        "Both bot and group links will make anyone that clicks on them instantly your referral, if he was not already referred and did not deposit yet"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("Redeem", callback_data="claim_referral_commission")],
-        [InlineKeyboardButton("🔗 Share link", url=f"https://t.me/share/url?url={referral_link}&text=Join%20Rollers%20Casino%20and%20win!")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # ── Generate referral image ──
-    try:
-        from casino_images import generate_ref_image, format_member_since
-        tg_user = update.message.from_user
-        full_name = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or username
-
-        avatar_bytes = None
-        try:
-            photos = await context.bot.get_user_profile_photos(tg_user.id, limit=1)
-            if photos and photos.photos:
-                pf = await context.bot.get_file(photos.photos[0][-1].file_id)
-                avatar_bytes = bytes(await pf.download_as_bytearray())
-        except Exception:
-            pass
-
-        total_earned  = available_funds + withdrawn_funds
-        avg_per_ref   = (total_earned / referrals_count) if referrals_count > 0 else 0.0
-
-        img_buf = generate_ref_image(
-            username           = username,
-            user_id            = user_id,
-            referral_code      = user_id[-8:].upper(),
-            invite_link        = referral_link,
-            total_referrals    = referrals_count,
-            wager_bonus        = f"${available_funds * 0.7:.2f}",
-            deposit_bonus      = f"${available_funds * 0.3:.2f}",
-            total_claimed      = f"${withdrawn_funds:.2f}",
-            available_to_claim = f"${available_funds:.2f}",
-            earnings_rate      = "0.35% | 1%",
-            total_earned       = f"${total_earned:.2f}",
-            avg_per_referral   = f"${avg_per_ref:.2f}",
-            top_earners        = [],
-            weekly_earnings    = [0.0] * 7,
-            avatar_bytes       = avatar_bytes,
-        )
-        await update.message.reply_photo(
-            photo        = img_buf,
-            caption      = f"🎁 <b>Your Referral Code:</b> <code>{user_id[-8:].upper()}</code>\n🔗 <b>Invite Link:</b> {referral_link}\n\nShare this image and link to invite friends to earn rewards!",
-            reply_markup = reply_markup,
-            parse_mode   = ParseMode.HTML,
-        )
-    except Exception as ref_err:
-        logger.error(f"Ref image error for {user_id}: {ref_err}", exc_info=True)
-        await update.message.reply_text(referral_message, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-
 
 async def _show_referral_screen(query, context) -> None:
     """Render the compact referral screen from a callback query."""
@@ -10951,22 +11015,58 @@ async def _show_referral_screen(query, context) -> None:
     pending = float(pending_referral_commissions.get(user_id, 0.0) or 0.0)
     claimed = float(referral_earnings.get(user_id, 0.0) or 0.0)
     ref_text = (
-        "ℹ️ <b>Earn bonus from invited users' games</b>\n\n"
-        f"🔗 <b>Referral link:</b> <a href=\"{referral_link}\">{referral_link}</a>\n"
-        "🔥 <b>Current system:</b> Revshare - 30%\n"
-        f"📈 <b>Users invited:</b> {_referral_count(user_id)}\n"
-        f"💰 <b>Total earned:</b> {format_balance_in_currency(pending + claimed, user_currency)}\n\n"
-        f"💵 <b>Referral balance:</b> {format_balance_in_currency(pending, user_currency)}"
+        '<tg-emoji emoji-id="6136241486854888906">ℹ️</tg-emoji> '
+        "<b>Earn bonus from invited users' games</b>\n\n"
+        f'🔗 Referral link: <a href="{referral_link}">{referral_link}</a>\n'
+        "🔥 Current system: Revshare - 30%\n"
+        f"📈 Users invited: {_referral_count(user_id)}\n"
+        f"💰 Total earned: {format_balance_in_currency(pending + claimed, user_currency)}\n\n"
+        f"💵 Referral balance: {format_balance_in_currency(pending, user_currency)}"
     )
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💸 Withdraw", callback_data="ref_withdraw")],
-        [InlineKeyboardButton("💬 For chat owners", callback_data="ref_chat_owners")],
-        [InlineKeyboardButton("◀️ Back", callback_data="back_to_menu")],
+        [primary_btn("Withdraw", callback_data="ref_withdraw")],
+        [primary_btn("Stats", callback_data="ref_stats")],
+        [primary_btn("For chat owners", callback_data="ref_chat_owners")],
+        [primary_btn("Back", callback_data="back_to_menu")],
     ])
     plain_emoji_token = _plain_emoji_context_cv.set("simple")
     try:
         await _edit_callback_text_or_send(
             query, context, ref_text, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    finally:
+        _plain_emoji_context_cv.reset(plain_emoji_token)
+
+
+async def _show_referral_stats_screen(query, context) -> None:
+    """Show referral activity totals only; no unrelated casino statistics."""
+    user_id = str(query.from_user.id)
+    currency = get_user_currency(user_id)
+    entry = _referral_stats_entry(user_id)
+    invited = _referral_count(user_id)
+    games = int(entry.get("games_played", 0) or 0)
+    deposits = int(entry.get("deposits_count", 0) or 0)
+    deposit_total = float(entry.get("deposits_total", 0.0) or 0.0)
+    pending = float(pending_referral_commissions.get(user_id, 0.0) or 0.0)
+    claimed = float(referral_earnings.get(user_id, 0.0) or 0.0)
+    stats_text = (
+        '<tg-emoji emoji-id="6136241486854888906">ℹ️</tg-emoji> '
+        "<b>Referral statistics</b>\n\n"
+        f"👥 Users invited: {invited}\n"
+        f"🎮 Games played: {games}\n"
+        f"📥 Deposits made: {deposits}\n"
+        f"💵 Deposited by referrals: {format_balance_in_currency(deposit_total, currency)}\n"
+        f"💰 Total earned: {format_balance_in_currency(pending + claimed, currency)}\n"
+        f"💳 Referral balance: {format_balance_in_currency(pending, currency)}"
+    )
+    markup = InlineKeyboardMarkup([
+        [primary_btn("Back to referrals", callback_data="ref_command")],
+        [primary_btn("Back", callback_data="back_to_menu")],
+    ])
+    plain_emoji_token = _plain_emoji_context_cv.set("simple")
+    try:
+        await _edit_callback_text_or_send(
+            query, context, stats_text, reply_markup=markup, parse_mode=ParseMode.HTML
         )
     finally:
         _plain_emoji_context_cv.reset(plain_emoji_token)
@@ -22577,8 +22677,8 @@ async def _sp_send_matchmaking(send_fn, context, sport, bet, mode_key, pts_str, 
     rolls, is_crazy, mode_char, mode_display, mode_desc = _sp_mode_params(mode_key)
     pt_label = f"{pts} point{'s' if pts > 1 else ''}"
     keyboard = [
-        [InlineKeyboardButton("✅ Accept Match",     callback_data=f"sp_pvp_{sport}_{bet}_{rolls}_{pts}_{user_id}_{mode_char}"),
-         InlineKeyboardButton("✅ Play against bot", callback_data=f"sp_vsbot_{sport}_{bet}_{rolls}_{pts}_{mode_char}")],
+        [primary_btn("Accept Match", callback_data=f"sp_pvp_{sport}_{bet}_{rolls}_{pts}_{user_id}_{mode_char}"),
+         danger_btn("Play against bot", callback_data=f"sp_vsbot_{sport}_{bet}_{rolls}_{pts}_{mode_char}")],
         [InlineKeyboardButton("Cancel",              callback_data="sp_cancel")],
     ]
     text = (
@@ -23224,7 +23324,7 @@ async def handle_dice_pvp_challenge(query: Update, context: ContextTypes.DEFAULT
     
     # Create accept button for other players
     accept_keyboard = [
-        [InlineKeyboardButton("✅ Accept Challenge", callback_data=f"accept_dice_pvp_{challenger_id}_{dice_format}_{bet_amount}")]
+        [primary_btn("Accept Challenge", callback_data=f"accept_dice_pvp_{challenger_id}_{dice_format}_{bet_amount}")]
     ]
     accept_markup = InlineKeyboardMarkup(accept_keyboard)
     
@@ -23398,10 +23498,9 @@ async def handle_bot_roll_turn(update, context: ContextTypes.DEFAULT_TYPE, user_
         )
         # Telegram already displays the animation in the chat. Prompt quickly
         # after the API response so the player can roll immediately.
-        await asyncio.sleep(0.35)
         # Clear rolling lock AFTER the animation wait completes.  Clearing it
-        # before the sleep would allow a button press during the 2-second wait
-        # to start a second concurrent handle_bot_roll_turn.
+        # before this point would allow a button press to start a second
+        # concurrent handle_bot_roll_turn.
         game_data['bot_rolling_active'] = False
         if user_id in active_games:
             active_games[user_id]['bot_rolling_active'] = False
@@ -23642,7 +23741,6 @@ async def handle_bot_roll_turn_by_id(context, user_id: str, chat_id: int) -> Non
         game_data['auto_rolling_player'] = False
         active_games[user_id] = game_data
         save_data()
-        await asyncio.sleep(0.35)
         # Clear rolling lock AFTER animation wait (same pattern as handle_bot_roll_turn)
         game_data['bot_rolling_active'] = False
         if user_id in active_games:
@@ -24344,6 +24442,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     elif query.data == "ref_command":
         await _show_referral_screen(query, context)
+    elif query.data == "ref_stats":
+        await _show_referral_stats_screen(query, context)
     elif query.data == "ref_chat_owners":
         await _show_chat_owner_referral_screen(query, context)
     elif query.data == "ref_language":
@@ -24953,6 +25053,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pass
             return
 
+        # The player control must never become a second roll stream while the
+        # visible bot animation is running or while another player update is
+        # being resolved.  This check intentionally happens before the
+        # callback is acknowledged and before any dice is sent.
+        if game_data.get("bot_rolling_active") or game_data.get("auto_rolling_player"):
+            try:
+                await query.answer("⏳ Please wait for your turn.", show_alert=True)
+            except Exception:
+                pass
+            return
+
         if (
             game_data.get("auto_rolling_player")
             or game_data.get("bot_rolling_active")
@@ -25066,6 +25177,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if query.data.startswith("bot_roll_start_"):
             # Bot rolls first
             game_data['state'] = EmojiGameState.WAITING_BOT_ROLL
+            active_games[user_id] = game_data
+            save_data()
             await query.edit_message_text(
                 f"{_rc_tag(_rc_game_emoji(game_data.get('game_name', 'dice')))} "
                 f"<b>Game started</b>",
@@ -25075,6 +25188,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             # Player rolls first
             game_data['state'] = EmojiGameState.WAITING_PLAYER_ROLL
+            active_games[user_id] = game_data
+            save_data()
             username = query.from_user.first_name
             game_name = game_data.get('game_name', 'dice')
             await query.edit_message_text(
@@ -36675,8 +36790,17 @@ async def _handle_dice_message_locked(update: Update, context: ContextTypes.DEFA
         game_data = active_games[user_id]
 
         # ── If bot is still rolling, tell player to wait instead of ignoring ──
-        if game_data.get('state') == 'bot_turn':
-            logger.info("[DICE_DIAG] ignored roll while bot is still rolling")
+        if game_data.get('state') in ('bot_turn', EmojiGameState.WAITING_BOT_ROLL):
+            logger.info("[DICE_DIAG] rejected roll while bot is still rolling")
+            last_notice = float(game_data.get("_last_turn_notice", 0.0) or 0.0)
+            if time.monotonic() - last_notice > 1.5:
+                game_data["_last_turn_notice"] = time.monotonic()
+                try:
+                    await update.message.reply_text(
+                        "⏳ It is not your turn yet. Please wait for the bot's roll."
+                    )
+                except Exception:
+                    pass
             return
 
         if game_data.get('state') == 'player_turn':
@@ -36821,6 +36945,15 @@ async def _handle_dice_message_locked(update: Update, context: ContextTypes.DEFA
                 f"[DICE_DIAG] REJECTED — state {game_data.get('state')!r} != WAITING_PLAYER_ROLL "
                 f"({EmojiGameState.WAITING_PLAYER_ROLL!r})"
             )
+            last_notice = float(game_data.get("_last_turn_notice", 0.0) or 0.0)
+            if time.monotonic() - last_notice > 1.5:
+                game_data["_last_turn_notice"] = time.monotonic()
+                try:
+                    await update.message.reply_text(
+                        "⏳ It is not your turn yet. Please wait for the bot's roll."
+                    )
+                except Exception:
+                    pass
             return
         if (
             game_data.get('bot_rolling_active')
@@ -36830,13 +36963,31 @@ async def _handle_dice_message_locked(update: Update, context: ContextTypes.DEFA
                 and not getattr(update, "from_roll_button", False)
             )
         ):
-            logger.info("[DICE_DIAG] ignored roll while the current round is resolving")
+            logger.info("[DICE_DIAG] rejected roll while the current round is resolving")
+            last_notice = float(game_data.get("_last_turn_notice", 0.0) or 0.0)
+            if time.monotonic() - last_notice > 1.5:
+                game_data["_last_turn_notice"] = time.monotonic()
+                try:
+                    await update.message.reply_text(
+                        "⏳ It is not your turn yet. Please wait for the current roll to finish."
+                    )
+                except Exception:
+                    pass
             return
         await handle_sports_dice_game(update, context, user_id, username, game_data)
         return
 
     # ── Everything below is for regular dice / PvP only ───────────────────
     if game_data.get('state') != EmojiGameState.WAITING_PLAYER_ROLL:
+        last_notice = float(game_data.get("_last_turn_notice", 0.0) or 0.0)
+        if time.monotonic() - last_notice > 1.5:
+            game_data["_last_turn_notice"] = time.monotonic()
+            try:
+                await update.message.reply_text(
+                    "⏳ It is not your turn yet. Please wait for the bot's roll."
+                )
+            except Exception:
+                pass
         return
     if (
         game_data.get('bot_rolling_active')
@@ -36846,6 +36997,15 @@ async def _handle_dice_message_locked(update: Update, context: ContextTypes.DEFA
             and not getattr(update, "from_roll_button", False)
         )
     ):
+        last_notice = float(game_data.get("_last_turn_notice", 0.0) or 0.0)
+        if time.monotonic() - last_notice > 1.5:
+            game_data["_last_turn_notice"] = time.monotonic()
+            try:
+                await update.message.reply_text(
+                    "⏳ It is not your turn yet. Please wait for the current roll to finish."
+                )
+            except Exception:
+                pass
         return
 
     # State and per-user serialization are the safety boundary.  Do not add a
