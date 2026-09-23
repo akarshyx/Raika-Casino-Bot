@@ -259,20 +259,33 @@ def _strip_custom_emoji_markup(text: str) -> str:
     return _TG_EMOJI_BLOCK_RE.sub(r"\1", str(text))
 
 
-_REFERRAL_SIMPLE_EMOJI_SYMBOLS = frozenset({
-    "ℹ️", "🔗", "🔥", "📈", "💰", "💵", "💬", "⭐", "💎",
-    "⚡", "👑", "🔒", "📥", "📤", "⚙️", "📉", "💸",
-})
+# Explicit Raika referral IDs from the simple flat sticker pack.  Do not build
+# this from CUSTOM_EMOJI_MAP: that global map is intentionally overridden by
+# the Roller's Casino game pack for the same Unicode characters.
+_RAIKA_REFERRAL_EMOJI_MAP = {
+    "ℹ️": "6136241486854888906",
+    "🔗": "6303082274606817714",
+    "🔥": "6305463928461730061",
+    "📈": "6305074108640010218",
+    "💰": "6305350683059035544",
+    "💵": "6305213806746278828",
+    "💬": "6305048995966230346",
+    "⭐": "6303097977007251313",
+    "💎": "6305343660787505763",
+    "⚡": "6303044564793959214",
+    "👑": "6305264921152069798",
+    "🔒": "6305561179406212646",
+    "📥": "6305348557050224003",
+    "📤": "6302862784598122395",
+    "⚙️": "6303180204156132744",
+    "📉": "6303027569608368590",
+}
 
 
 def _emoji_map_for_context() -> dict:
-    """Restrict referral screens to the pack's simple, flat emoji symbols."""
+    """Use only the verified Raika-style map on referral screens."""
     if _plain_emoji_context_cv.get() == "simple":
-        return {
-            symbol: emoji_id
-            for symbol, emoji_id in CUSTOM_EMOJI_MAP.items()
-            if symbol in _REFERRAL_SIMPLE_EMOJI_SYMBOLS
-        }
+        return _RAIKA_REFERRAL_EMOJI_MAP
     return CUSTOM_EMOJI_MAP
 
 
